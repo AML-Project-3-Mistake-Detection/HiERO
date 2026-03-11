@@ -47,9 +47,28 @@ import hydra
 import numpy as np
 import torch
 import torch.nn.functional as F
+from scipy.stats import truncnorm
 from torch_geometric.data import Data
 
 from egoprocel.utils import clusterize
+
+# Ground-truth statistics for steps-per-video (from dataset annotations)
+_GT_STEPS_MEAN   = 14.10
+_GT_STEPS_STD    = 4.36
+_GT_STEPS_MIN    = 5
+_GT_STEPS_MAX    = 25
+
+
+def sample_num_steps(rng: np.random.Generator) -> int:
+    """Sample a plausible number of steps from the ground-truth distribution.
+
+    Uses a truncated normal (mean=14.1, std=4.36) clipped to [5, 25].
+    """
+    a = (_GT_STEPS_MIN - _GT_STEPS_MEAN) / _GT_STEPS_STD
+    b = (_GT_STEPS_MAX - _GT_STEPS_MEAN) / _GT_STEPS_STD
+    value = truncnorm.rvs(a, b, loc=_GT_STEPS_MEAN, scale=_GT_STEPS_STD,
+                          random_state=rng)
+    return int(round(value))
 
 
 def build_hiero_model(ckpt: str, fps: float, depth: int, use_proj_head: bool,
@@ -173,10 +192,20 @@ def labels_to_steps(labels: np.ndarray, seg_duration: float) -> list:
     # Sort by start_time (first appearance in the video)
     cluster_info.sort(key=lambda x: x[0])
 
-    return [
+    steps = [
         {"step_id": step_id, "start_time": start, "end_time": end}
         for start, end, step_id in cluster_info
     ]
+
+    # Resolve overlaps: clip each step's end_time to the next step's start_time
+    for i in range(len(steps) - 1):
+        if steps[i]["end_time"] > steps[i + 1]["start_time"]:
+            steps[i]["end_time"] = steps[i + 1]["start_time"]
+
+    # Drop any steps that collapsed to zero (or negative) duration after clipping
+    steps = [s for s in steps if s["end_time"] > s["start_time"]]
+
+    return steps
 
 
 def main():
@@ -193,8 +222,12 @@ def main():
                         help="Feature stride (in frames, consistent with fps)")
     parser.add_argument("--depth", type=int, default=2,
                         help="Decoder depth level to extract features from (0=finest)")
-    parser.add_argument("--num_steps", type=int, default=14,
-                        help="Default number of procedure steps per video (ground-truth median=14, mean=14.1)")
+    parser.add_argument("--num_steps", type=int, default=None,
+                        help="Fix the number of steps for all videos. If not set, samples per-video "
+                             "from a truncated normal (mean=14.1, std=4.36, min=5, max=25) "
+                             "matching ground-truth statistics.")
+    parser.add_argument("--seed", type=int, default=42,
+                        help="Random seed for per-video step count sampling")
     parser.add_argument("--steps_config", default=None,
                         help="JSON file mapping video filenames to their specific step count")
     parser.add_argument("--no_background", action="store_true",
@@ -214,6 +247,14 @@ def main():
         with open(args.steps_config) as f:
             per_video_steps = json.load(f)
         print(f"Loaded per-video step counts for {len(per_video_steps)} videos from '{args.steps_config}'")
+
+    rng = np.random.default_rng(args.seed)
+    if args.num_steps is None:
+        print(f"No --num_steps set: will sample per-video from "
+              f"truncated normal (mean={_GT_STEPS_MEAN}, std={_GT_STEPS_STD}, "
+              f"range=[{_GT_STEPS_MIN}, {_GT_STEPS_MAX}]) with seed={args.seed}")
+    else:
+        print(f"Using fixed num_steps={args.num_steps} for all videos")
 
     print(f"Device : {args.device}")
     print(f"Loading model from {args.ckpt}...")
@@ -240,8 +281,13 @@ def main():
         video_name = os.path.basename(npz_path)
         features = load_npz_features(npz_path)          # [N, 256]
 
-        # Per-video step count overrides the global default
-        num_steps = per_video_steps.get(video_name, args.num_steps)
+        # Per-video step count: explicit config > fixed CLI arg > sampled from GT distribution
+        if video_name in per_video_steps:
+            num_steps = int(per_video_steps[video_name])
+        elif args.num_steps is not None:
+            num_steps = args.num_steps
+        else:
+            num_steps = sample_num_steps(rng)
 
         # Run HiERO temporal backbone
         segment_features = features_extractor(features)  # [M, hidden_size]
@@ -282,7 +328,7 @@ def main():
 
         n_bg = int((step_labels == -1).sum()) if use_background else 0
         print(f"  {video_name}: {features.shape[0]} input segs → "
-              f"{M} decoded segs → {len(steps)} steps "
+              f"{M} decoded segs ({num_steps} steps requested) → {len(steps)} steps found "
               f"({n_bg} background segs = {n_bg * seg_duration:.0f}s of gaps)")
         for s in steps:
             print(f"    step_id {s['step_id']:2d}  [{s['start_time']:7.1f}s – {s['end_time']:7.1f}s]")
