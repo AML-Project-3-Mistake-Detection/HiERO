@@ -15,19 +15,23 @@ Each .npz file in `feature_dir` is expected to contain an 'arr_0' array of shape
   step count, e.g.: {"1_10_360p_224.mp4_1s_1s.npz": 5, "1_14_360p_224.mp4_1s_1s.npz": 9}
   Per-video values override --num_steps.
 
-Output format (results.json):
+Output format (results.json) mirrors the ground-truth annotation structure:
 {
-  "video_name.npz": [
-    {"step": 3, "start": 5.0,  "end": 18.0},
-    {"step": 1, "start": 25.0, "end": 60.0},
-    ...
-  ],
-  ...
+  "1_7": {
+    "recording_id": "1_7",
+    "steps": [
+      {"step_id": 2, "start_time": 5.0,   "end_time": 38.0},
+      {"step_id": 0, "start_time": 55.0,  "end_time": 120.0},
+      {"step_id": 3, "start_time": 145.0, "end_time": 200.0},
+      ...
+    ]
+  }
 }
-Each entry is one detected step interval (start/end in seconds), ordered
-chronologically. Gaps between entries are background (no step is occurring).
-Step labels are integers in [0, num_steps-1]; the same label can reappear
-non-contiguously (the same step type done at different moments in the video).
+Each entry is one step, ordered by start_time. Each step appears exactly once.
+The interval [start_time, end_time] spans all segments of that cluster.
+Gaps between entries are background. step_id values are arbitrary cluster IDs
+assigned by the model (they won't match ground-truth step numbers, but the
+temporal segmentation is what matters).
 
 Background detection: by default, num_steps+1 clusters are found and the
 least coherent one (lowest mean intra-cluster cosine similarity) is treated
@@ -137,50 +141,42 @@ def identify_background_cluster(features: torch.Tensor, labels: np.ndarray, n: i
     return int(np.argmin(mean_sim))
 
 
-def labels_to_intervals(labels: np.ndarray, seg_duration: float) -> list:
+def labels_to_steps(labels: np.ndarray, seg_duration: float) -> list:
     """
-    Convert a per-segment label array into a list of (start, end, step) intervals.
+    Convert per-segment cluster labels into one interval per step.
 
-    Segments with label -1 (background) are skipped, producing gaps in the
-    output. Consecutive segments with the same non-background label are merged.
+    Each cluster (excluding -1 background) produces one entry. Entries are
+    sorted by the first time the cluster appears in the video. The interval
+    [start_time, end_time] is the bounding box of all segments in the cluster.
 
     Parameters
     ----------
-    labels : ndarray[M]  — integer step label; -1 means background/no-step
+    labels : ndarray[M]  — integer cluster label; -1 means background/no-step
     seg_duration : float — duration in seconds of each decoded segment
 
     Returns
     -------
-    List of dicts: [{"step": int, "start": float, "end": float}, ...]
-    ordered chronologically, with gaps where background segments were detected.
+    List of dicts: [{"step_id": int, "start_time": float, "end_time": float}, ...]
+    one entry per step, sorted by start_time.
     """
-    intervals = []
-    if len(labels) == 0:
-        return intervals
+    unique_clusters = [c for c in np.unique(labels) if c != -1]
+    if not unique_clusters:
+        return []
 
-    current_label = labels[0]
-    seg_start = 0
+    cluster_info = []
+    for c in unique_clusters:
+        idxs = np.where(labels == c)[0]
+        start = round(float(idxs.min()) * seg_duration, 3)
+        end   = round(float(idxs.max() + 1) * seg_duration, 3)
+        cluster_info.append((start, end, int(c)))
 
-    for i in range(1, len(labels)):
-        if labels[i] != current_label:
-            if current_label != -1:
-                intervals.append({
-                    "step":  int(current_label),
-                    "start": round(seg_start * seg_duration, 3),
-                    "end":   round(i * seg_duration, 3),
-                })
-            current_label = labels[i]
-            seg_start = i
+    # Sort by start_time (first appearance in the video)
+    cluster_info.sort(key=lambda x: x[0])
 
-    # Last run
-    if current_label != -1:
-        intervals.append({
-            "step":  int(current_label),
-            "start": round(seg_start * seg_duration, 3),
-            "end":   round(len(labels) * seg_duration, 3),
-        })
-
-    return intervals
+    return [
+        {"step_id": step_id, "start_time": start, "end_time": end}
+        for start, end, step_id in cluster_info
+    ]
 
 
 def main():
@@ -273,26 +269,23 @@ def main():
 
         if use_background:
             bg = identify_background_cluster(segment_features, step_labels, n_clusters)
-            # Remap: background → -1; renumber the rest 0..num_steps-1
-            remapped = np.full_like(step_labels, -1)
-            new_id = 0
-            for c in range(n_clusters):
-                if c == bg:
-                    continue
-                remapped[step_labels == c] = new_id
-                new_id += 1
-            step_labels = remapped
+            # Mark background segments as -1; keep all other raw cluster IDs
+            step_labels = np.where(step_labels == bg, -1, step_labels)
 
-        # Convert per-segment labels to (start, end) intervals; gaps = background
-        intervals = labels_to_intervals(step_labels, seg_duration)
-        results[video_name] = intervals
+        # One interval per step, sorted by start_time
+        steps = labels_to_steps(step_labels, seg_duration)
+        recording_id = os.path.splitext(video_name)[0].replace("_360p_224.mp4_1s_1s", "")
+        results[recording_id] = {
+            "recording_id": recording_id,
+            "steps": steps,
+        }
 
         n_bg = int((step_labels == -1).sum()) if use_background else 0
         print(f"  {video_name}: {features.shape[0]} input segs → "
-              f"{M} decoded segs → {len(intervals)} step intervals "
+              f"{M} decoded segs → {len(steps)} steps "
               f"({n_bg} background segs = {n_bg * seg_duration:.0f}s of gaps)")
-        for iv in intervals:
-            print(f"    step {iv['step']:2d}  [{iv['start']:7.1f}s – {iv['end']:7.1f}s]")
+        for s in steps:
+            print(f"    step_id {s['step_id']:2d}  [{s['start_time']:7.1f}s – {s['end_time']:7.1f}s]")
 
     with open(args.output, "w") as f:
         json.dump(results, f, indent=2)
