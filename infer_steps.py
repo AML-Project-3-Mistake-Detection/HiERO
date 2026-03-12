@@ -111,7 +111,7 @@ def build_hiero_model(ckpt: str, fps: float, depth: int, use_proj_head: bool,
         Tensor[M, hidden_size]  — one feature per decoded node at `depth`
         """
         N = features.shape[0]
-        pos     = torch.arange(N, device=device, dtype=torch.float) * node_length
+        pos     = torch.arange(N, device=device, dtype=torch.float) * (stride / fps)
         indices = torch.arange(N, device=device)
         batch   = torch.zeros(N, dtype=torch.long, device=device)
         mask    = torch.ones(N, dtype=torch.bool, device=device)
@@ -207,10 +207,10 @@ def labels_to_steps(labels: np.ndarray, seg_duration: float, smooth_window: int 
 
     The label sequence is first smoothed with a mode filter to consolidate
     scattered noise assignments into coherent regions.  Each cluster's interval
-    is then its **full temporal span** (first to last occurrence) in the
-    smoothed sequence.  Using the span rather than the densest core is
-    essential: GT steps typically last 20–80 s, and a longest-contiguous-run
-    heuristic would capture only a short core fragment while leaving large gaps.
+    is then its **longest contiguous run** in the smoothed sequence.  With
+    temporally-constrained agglomerative clustering each cluster is already a
+    single contiguous block; the run heuristic here handles any small fragments
+    introduced by the mode-smoothing pass without bridging gaps across time.
 
     Parameters
     ----------
@@ -231,23 +231,39 @@ def labels_to_steps(labels: np.ndarray, seg_duration: float, smooth_window: int 
 
     steps = []
     for c in unique_clusters:
-        # Use the full span in the smoothed sequence so the interval covers
-        # the step's complete temporal extent, not just its densest core.
         idxs = np.where(smoothed == c)[0]
         if len(idxs) == 0:
             # Cluster was completely smoothed away; fall back to raw labels.
             idxs = np.where(labels == c)[0]
         if len(idxs) == 0:
             continue
+
+        # Find the longest contiguous run of this cluster label.
+        # With temporally-constrained clustering each cluster is already a single
+        # contiguous block, but the mode-smoothing pass may fragment it slightly;
+        # taking the longest run avoids capturing scattered noise segments.
+        best_start = best_end = cur_start = idxs[0]
+        for prev, cur in zip(idxs, idxs[1:]):
+            if cur == prev + 1:
+                best_end = cur
+            else:
+                if (best_end - cur_start) < (cur - cur_start):
+                    best_start, best_end = cur_start, prev
+                cur_start = cur
+                best_end = max(best_end, prev)
+        # Handle the last run
+        if (cur_start <= idxs[-1]) and (idxs[-1] - cur_start) >= (best_end - best_start):
+            best_start, best_end = cur_start, idxs[-1]
+
         steps.append({
             "step_id":    int(c),
-            "start_time": round(int(idxs.min()) * seg_duration, 3),
-            "end_time":   round((int(idxs.max()) + 1) * seg_duration, 3),
+            "start_time": round(int(best_start) * seg_duration, 3),
+            "end_time":   round((int(best_end) + 1) * seg_duration, 3),
         })
 
     steps.sort(key=lambda x: x["start_time"])
 
-    # Resolve overlaps: clip the earlier step's end to the later step's start.
+    # Resolve any residual overlaps after smoothing.
     for i in range(len(steps) - 1):
         if steps[i]["end_time"] > steps[i + 1]["start_time"]:
             steps[i]["end_time"] = steps[i + 1]["start_time"]
@@ -282,7 +298,7 @@ def main():
                              "extracting step intervals. Larger = smoother boundaries. Default 5 ≈ 20s.")
     parser.add_argument("--no_background", action="store_true",
                         help="Disable background cluster detection (every segment is assigned to a step)")
-    parser.add_argument("--temp", type=float, default=0.5,
+    parser.add_argument("--temp", type=float, default=0.05,
                         help="Temperature for spectral clustering affinity kernel")
     parser.add_argument("--use_proj_head", action="store_true",
                         help="Use the language-aligned projection head")
@@ -332,6 +348,10 @@ def main():
     all_embeddings = {}  # recording_id → ndarray [S, 256]
     for npz_path in npz_files:
         video_name = os.path.basename(npz_path)
+        recording_id = os.path.splitext(video_name)[0].replace("_360p_224.mp4_1s_1s", "")
+        if recording_id in results:
+            print(f"  WARNING: {video_name}: duplicate recording_id '{recording_id}', skipping.")
+            continue
         features = load_npz_features(npz_path)          # [N, 256]
 
         # Per-video step count: explicit config > fixed CLI arg > sampled from GT distribution
@@ -348,7 +368,7 @@ def main():
 
         if M == 0:
             print(f"  WARNING: {video_name}: no decoded segments produced, skipping.")
-            results[video_name] = []
+            results[recording_id] = {"recording_id": recording_id, "steps": []}
             continue
 
         # When using background detection we cluster into num_steps+1 groups;
@@ -377,11 +397,9 @@ def main():
         # Step-level embeddings: average raw EgoVLP features within each step's boundaries
         step_embeddings = compute_step_embeddings(features, steps, fps=args.fps)
 
-        recording_id = os.path.splitext(video_name)[0].replace("_360p_224.mp4_1s_1s", "")
         results[recording_id] = {
             "recording_id": recording_id,
             "steps": steps,
-            "embeddings_shape": list(step_embeddings.shape),  # [S, 256]
         }
         all_embeddings[recording_id] = step_embeddings
 
