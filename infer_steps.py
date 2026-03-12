@@ -143,6 +143,27 @@ def load_npz_features(path: str) -> torch.Tensor:
     return torch.from_numpy(d[key].astype(np.float32))
 
 
+def identify_background_cluster(features: torch.Tensor, labels: np.ndarray, n: int) -> int:
+    """
+    Return the cluster index most likely to be background.
+
+    The background cluster is the one with the lowest mean intra-cluster
+    cosine similarity — its members look least like each other, which is
+    characteristic of heterogeneous transition/gap segments.
+    """
+    feats = F.normalize(features.cpu().float(), p=2, dim=-1)
+    mean_sim = []
+    for c in range(n):
+        mask = labels == c
+        if mask.sum() <= 1:
+            mean_sim.append(-1.0)   # single-member: maximally incoherent
+            continue
+        cluster_feats = feats[mask]
+        sim = (cluster_feats @ cluster_feats.T).mean().item()
+        mean_sim.append(sim)
+    return int(np.argmin(mean_sim))
+
+
 def compute_step_embeddings(raw_features: torch.Tensor, steps: list, fps: float) -> np.ndarray:
     """Average the raw EgoVLP features within each step's time boundaries.
 
