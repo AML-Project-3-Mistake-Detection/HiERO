@@ -57,10 +57,10 @@ from torch_geometric.data import Data
 from egoprocel.utils import clusterize
 
 # Ground-truth statistics for steps-per-video (from dataset annotations)
-_GT_STEPS_MEAN   = 14.10
-_GT_STEPS_STD    = 4.36
-_GT_STEPS_MIN    = 5
-_GT_STEPS_MAX    = 25
+_GT_STEPS_MEAN   = 14.84
+_GT_STEPS_STD    = 4.38
+_GT_STEPS_MIN    = 7
+_GT_STEPS_MAX    = 26
 
 
 def sample_num_steps(rng: np.random.Generator) -> int:
@@ -187,26 +187,6 @@ def compute_step_embeddings(raw_features: torch.Tensor, steps: list, fps: float)
     return np.stack(embeddings) if embeddings else np.empty((0, feat.shape[1]))
 
 
-    """
-    Return the cluster index most likely to be background.
-
-    The background cluster is the one with the lowest mean intra-cluster
-    cosine similarity — its members look least like each other, which is
-    characteristic of heterogeneous transition/gap segments.
-    """
-    feats = F.normalize(features.cpu().float(), p=2, dim=-1)
-    mean_sim = []
-    for c in range(n):
-        mask = labels == c
-        if mask.sum() <= 1:
-            mean_sim.append(-1.0)   # single-member: maximally incoherent
-            continue
-        cluster_feats = feats[mask]
-        sim = (cluster_feats @ cluster_feats.T).mean().item()
-        mean_sim.append(sim)
-    return int(np.argmin(mean_sim))
-
-
 def _smooth_labels(labels: np.ndarray, window: int) -> np.ndarray:
     """Replace each position with the mode label in a sliding window."""
     if window <= 1 or len(labels) <= window:
@@ -221,34 +201,16 @@ def _smooth_labels(labels: np.ndarray, window: int) -> np.ndarray:
     return smoothed
 
 
-def _longest_run(mask: np.ndarray):
-    """Return (start, end_exclusive, length) of the longest contiguous True run."""
-    best = (0, 0, 0)
-    run_start = None
-    for i, v in enumerate(mask):
-        if v:
-            if run_start is None:
-                run_start = i
-        else:
-            if run_start is not None:
-                length = i - run_start
-                if length > best[2]:
-                    best = (run_start, i, length)
-                run_start = None
-    if run_start is not None:
-        length = len(mask) - run_start
-        if length > best[2]:
-            best = (run_start, len(mask), length)
-    return best
-
-
 def labels_to_steps(labels: np.ndarray, seg_duration: float, smooth_window: int = 5) -> list:
     """
     Convert per-segment cluster labels into one interval per step.
 
-    The label sequence is first smoothed with a mode filter to remove scattered
-    noise assignments. Each cluster's interval is then its longest contiguous run
-    in the smoothed sequence, giving compact, well-distributed timestamps.
+    The label sequence is first smoothed with a mode filter to consolidate
+    scattered noise assignments into coherent regions.  Each cluster's interval
+    is then its **full temporal span** (first to last occurrence) in the
+    smoothed sequence.  Using the span rather than the densest core is
+    essential: GT steps typically last 20–80 s, and a longest-contiguous-run
+    heuristic would capture only a short core fragment while leaving large gaps.
 
     Parameters
     ----------
@@ -269,21 +231,23 @@ def labels_to_steps(labels: np.ndarray, seg_duration: float, smooth_window: int 
 
     steps = []
     for c in unique_clusters:
-        start, end, length = _longest_run(smoothed == c)
-        if length == 0:
-            # Cluster was fully smoothed away; fall back to raw first/last occurrence
+        # Use the full span in the smoothed sequence so the interval covers
+        # the step's complete temporal extent, not just its densest core.
+        idxs = np.where(smoothed == c)[0]
+        if len(idxs) == 0:
+            # Cluster was completely smoothed away; fall back to raw labels.
             idxs = np.where(labels == c)[0]
-            start = int(idxs.min())
-            end   = int(idxs.max()) + 1
+        if len(idxs) == 0:
+            continue
         steps.append({
             "step_id":    int(c),
-            "start_time": round(start * seg_duration, 3),
-            "end_time":   round(end   * seg_duration, 3),
+            "start_time": round(int(idxs.min()) * seg_duration, 3),
+            "end_time":   round((int(idxs.max()) + 1) * seg_duration, 3),
         })
 
     steps.sort(key=lambda x: x["start_time"])
 
-    # Safety: resolve any residual overlaps
+    # Resolve overlaps: clip the earlier step's end to the later step's start.
     for i in range(len(steps) - 1):
         if steps[i]["end_time"] > steps[i + 1]["start_time"]:
             steps[i]["end_time"] = steps[i + 1]["start_time"]

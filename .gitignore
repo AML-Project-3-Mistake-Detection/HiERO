@@ -1,2 +1,4 @@
 pretrained/*
 video_features/*
+results.json
+gt_step_annotations/*
