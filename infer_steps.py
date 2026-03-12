@@ -15,23 +15,27 @@ Each .npz file in `feature_dir` is expected to contain an 'arr_0' array of shape
   step count, e.g.: {"1_10_360p_224.mp4_1s_1s.npz": 5, "1_14_360p_224.mp4_1s_1s.npz": 9}
   Per-video values override --num_steps.
 
-Output format (results.json) mirrors the ground-truth annotation structure:
-{
-  "1_7": {
-    "recording_id": "1_7",
-    "steps": [
-      {"step_id": 2, "start_time": 5.0,   "end_time": 38.0},
-      {"step_id": 0, "start_time": 55.0,  "end_time": 120.0},
-      {"step_id": 3, "start_time": 145.0, "end_time": 200.0},
-      ...
-    ]
+Output:
+  results.json  — step intervals per video, mirroring the annotation structure:
+  {
+    "1_7": {
+      "recording_id": "1_7",
+      "steps": [
+        {"step_id": 2, "start_time": 5.0,  "end_time": 38.0},
+        {"step_id": 0, "start_time": 55.0, "end_time": 120.0},
+        ...
+      ]
+    }
   }
-}
-Each entry is one step, ordered by start_time. Each step appears exactly once.
-The interval [start_time, end_time] spans all segments of that cluster.
-Gaps between entries are background. step_id values are arbitrary cluster IDs
-assigned by the model (they won't match ground-truth step numbers, but the
-temporal segmentation is what matters).
+
+  embeddings.npz  — step-level EgoVLP embeddings (averaged over each step's
+  time range). Contains one array per recording_id, shape [num_steps, 256].
+  Load with: data = np.load('embeddings.npz'); emb = data['1_7']  # [S, 256]
+
+Step-level embeddings: for each detected step (start_time, end_time), the
+original EgoVLP features (1 feature/second) that fall within that range are
+averaged into a single 256-d vector. This is the step-level representation
+used for downstream recipe understanding tasks.
 
 Background detection: by default, num_steps+1 clusters are found and the
 least coherent one (lowest mean intra-cluster cosine similarity) is treated
@@ -139,7 +143,29 @@ def load_npz_features(path: str) -> torch.Tensor:
     return torch.from_numpy(d[key].astype(np.float32))
 
 
-def identify_background_cluster(features: torch.Tensor, labels: np.ndarray, n: int) -> int:
+def compute_step_embeddings(raw_features: torch.Tensor, steps: list, fps: float) -> np.ndarray:
+    """Average the raw EgoVLP features within each step's time boundaries.
+
+    Parameters
+    ----------
+    raw_features : Tensor[N, feature_dim]  — original features (1 per second at fps=1)
+    steps        : list of {start_time, end_time, ...} dicts
+    fps          : features per second of raw_features
+
+    Returns
+    -------
+    ndarray[S, feature_dim]  — one averaged embedding per step
+    """
+    feat = raw_features.cpu().numpy()  # [N, D]
+    embeddings = []
+    for step in steps:
+        i_start = int(step["start_time"] * fps)
+        i_end   = max(i_start + 1, int(step["end_time"] * fps))
+        i_end   = min(i_end, len(feat))
+        embeddings.append(feat[i_start:i_end].mean(axis=0))
+    return np.stack(embeddings) if embeddings else np.empty((0, feat.shape[1]))
+
+
     """
     Return the cluster index most likely to be background.
 
@@ -160,52 +186,88 @@ def identify_background_cluster(features: torch.Tensor, labels: np.ndarray, n: i
     return int(np.argmin(mean_sim))
 
 
-def labels_to_steps(labels: np.ndarray, seg_duration: float) -> list:
+def _smooth_labels(labels: np.ndarray, window: int) -> np.ndarray:
+    """Replace each position with the mode label in a sliding window."""
+    if window <= 1 or len(labels) <= window:
+        return labels.copy()
+    smoothed = np.empty_like(labels)
+    half = window // 2
+    for i in range(len(labels)):
+        lo = max(0, i - half)
+        hi = min(len(labels), i + half + 1)
+        vals, counts = np.unique(labels[lo:hi], return_counts=True)
+        smoothed[i] = vals[np.argmax(counts)]
+    return smoothed
+
+
+def _longest_run(mask: np.ndarray):
+    """Return (start, end_exclusive, length) of the longest contiguous True run."""
+    best = (0, 0, 0)
+    run_start = None
+    for i, v in enumerate(mask):
+        if v:
+            if run_start is None:
+                run_start = i
+        else:
+            if run_start is not None:
+                length = i - run_start
+                if length > best[2]:
+                    best = (run_start, i, length)
+                run_start = None
+    if run_start is not None:
+        length = len(mask) - run_start
+        if length > best[2]:
+            best = (run_start, len(mask), length)
+    return best
+
+
+def labels_to_steps(labels: np.ndarray, seg_duration: float, smooth_window: int = 5) -> list:
     """
     Convert per-segment cluster labels into one interval per step.
 
-    Each cluster (excluding -1 background) produces one entry. Entries are
-    sorted by the first time the cluster appears in the video. The interval
-    [start_time, end_time] is the bounding box of all segments in the cluster.
+    The label sequence is first smoothed with a mode filter to remove scattered
+    noise assignments. Each cluster's interval is then its longest contiguous run
+    in the smoothed sequence, giving compact, well-distributed timestamps.
 
     Parameters
     ----------
     labels : ndarray[M]  — integer cluster label; -1 means background/no-step
     seg_duration : float — duration in seconds of each decoded segment
+    smooth_window : int  — mode-filter window size (in segments)
 
     Returns
     -------
     List of dicts: [{"step_id": int, "start_time": float, "end_time": float}, ...]
-    one entry per step, sorted by start_time.
+    one entry per step, sorted by start_time, guaranteed non-overlapping.
     """
     unique_clusters = [c for c in np.unique(labels) if c != -1]
     if not unique_clusters:
         return []
 
-    cluster_info = []
+    smoothed = _smooth_labels(labels, window=smooth_window)
+
+    steps = []
     for c in unique_clusters:
-        idxs = np.where(labels == c)[0]
-        start = round(float(idxs.min()) * seg_duration, 3)
-        end   = round(float(idxs.max() + 1) * seg_duration, 3)
-        cluster_info.append((start, end, int(c)))
+        start, end, length = _longest_run(smoothed == c)
+        if length == 0:
+            # Cluster was fully smoothed away; fall back to raw first/last occurrence
+            idxs = np.where(labels == c)[0]
+            start = int(idxs.min())
+            end   = int(idxs.max()) + 1
+        steps.append({
+            "step_id":    int(c),
+            "start_time": round(start * seg_duration, 3),
+            "end_time":   round(end   * seg_duration, 3),
+        })
 
-    # Sort by start_time (first appearance in the video)
-    cluster_info.sort(key=lambda x: x[0])
+    steps.sort(key=lambda x: x["start_time"])
 
-    steps = [
-        {"step_id": step_id, "start_time": start, "end_time": end}
-        for start, end, step_id in cluster_info
-    ]
-
-    # Resolve overlaps: clip each step's end_time to the next step's start_time
+    # Safety: resolve any residual overlaps
     for i in range(len(steps) - 1):
         if steps[i]["end_time"] > steps[i + 1]["start_time"]:
             steps[i]["end_time"] = steps[i + 1]["start_time"]
 
-    # Drop any steps that collapsed to zero (or negative) duration after clipping
-    steps = [s for s in steps if s["end_time"] > s["start_time"]]
-
-    return steps
+    return [s for s in steps if s["end_time"] > s["start_time"]]
 
 
 def main():
@@ -230,6 +292,9 @@ def main():
                         help="Random seed for per-video step count sampling")
     parser.add_argument("--steps_config", default=None,
                         help="JSON file mapping video filenames to their specific step count")
+    parser.add_argument("--smooth_window", type=int, default=5,
+                        help="Mode-filter window (in decoded segments) for temporal smoothing before "
+                             "extracting step intervals. Larger = smoother boundaries. Default 5 ≈ 20s.")
     parser.add_argument("--no_background", action="store_true",
                         help="Disable background cluster detection (every segment is assigned to a step)")
     parser.add_argument("--temp", type=float, default=0.5,
@@ -239,6 +304,8 @@ def main():
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--output", default="results.json",
                         help="Output JSON file with step intervals")
+    parser.add_argument("--embeddings_output", default="embeddings.npz",
+                        help="Output .npz file with step-level EgoVLP embeddings (shape [S, 256] per video)")
     args = parser.parse_args()
 
     # Load per-video step counts if provided
@@ -277,6 +344,7 @@ def main():
     print(f"Found {len(npz_files)} feature files. Running HiERO inference...\n")
 
     results = {}
+    all_embeddings = {}  # recording_id → ndarray [S, 256]
     for npz_path in npz_files:
         video_name = os.path.basename(npz_path)
         features = load_npz_features(npz_path)          # [N, 256]
@@ -318,13 +386,19 @@ def main():
             # Mark background segments as -1; keep all other raw cluster IDs
             step_labels = np.where(step_labels == bg, -1, step_labels)
 
-        # One interval per step, sorted by start_time
-        steps = labels_to_steps(step_labels, seg_duration)
+        # One interval per step (longest contiguous run after smoothing), sorted by start_time
+        steps = labels_to_steps(step_labels, seg_duration, smooth_window=args.smooth_window)
+
+        # Step-level embeddings: average raw EgoVLP features within each step's boundaries
+        step_embeddings = compute_step_embeddings(features, steps, fps=args.fps)
+
         recording_id = os.path.splitext(video_name)[0].replace("_360p_224.mp4_1s_1s", "")
         results[recording_id] = {
             "recording_id": recording_id,
             "steps": steps,
+            "embeddings_shape": list(step_embeddings.shape),  # [S, 256]
         }
+        all_embeddings[recording_id] = step_embeddings
 
         n_bg = int((step_labels == -1).sum()) if use_background else 0
         print(f"  {video_name}: {features.shape[0]} input segs → "
@@ -335,8 +409,11 @@ def main():
 
     with open(args.output, "w") as f:
         json.dump(results, f, indent=2)
+    print(f"Step intervals saved to '{args.output}'")
 
-    print(f"\nResults saved to '{args.output}'")
+    np.savez(args.embeddings_output, **all_embeddings)
+    print(f"Step embeddings saved to '{args.embeddings_output}' "
+          f"({len(all_embeddings)} videos, use np.load('{args.embeddings_output}') to load)")
 
 
 if __name__ == "__main__":
