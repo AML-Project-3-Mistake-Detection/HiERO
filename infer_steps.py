@@ -188,7 +188,14 @@ def compute_step_embeddings(raw_features: torch.Tensor, steps: list, fps: float)
 
 
 def _smooth_labels(labels: np.ndarray, window: int) -> np.ndarray:
-    """Replace each position with the mode label in a sliding window."""
+    """Replace each position with the mode label in a sliding window.
+
+    Background segments (label == -1) are never overwritten: smoothing only
+    redistributes step labels among non-background positions.  This preserves
+    genuine gaps between steps (e.g. transition/travel segments) that would
+    otherwise be swallowed when a short run of -1 labels is surrounded by a
+    dominant step cluster on each side.
+    """
     if window <= 1 or len(labels) <= window:
         return labels.copy()
     smoothed = np.empty_like(labels)
@@ -198,6 +205,8 @@ def _smooth_labels(labels: np.ndarray, window: int) -> np.ndarray:
         hi = min(len(labels), i + half + 1)
         vals, counts = np.unique(labels[lo:hi], return_counts=True)
         smoothed[i] = vals[np.argmax(counts)]
+    # Restore background labels so smoothing never closes a gap between steps.
+    smoothed[labels == -1] = -1
     return smoothed
 
 
