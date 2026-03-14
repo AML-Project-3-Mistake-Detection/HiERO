@@ -204,7 +204,13 @@ def _smooth_labels(labels: np.ndarray, window: int) -> np.ndarray:
         lo = max(0, i - half)
         hi = min(len(labels), i + half + 1)
         vals, counts = np.unique(labels[lo:hi], return_counts=True)
-        smoothed[i] = vals[np.argmax(counts)]
+        # On tie, prefer retaining current label to avoid boundary drift
+        max_count = counts.max()
+        tied_labels = vals[counts == max_count]
+        if labels[i] in tied_labels:
+            smoothed[i] = labels[i]
+        else:
+            smoothed[i] = vals[np.argmax(counts)]
     # Restore background labels so smoothing never closes a gap between steps.
     smoothed[labels == -1] = -1
     return smoothed
@@ -251,18 +257,21 @@ def labels_to_steps(labels: np.ndarray, seg_duration: float, smooth_window: int 
         # With temporally-constrained clustering each cluster is already a single
         # contiguous block, but the mode-smoothing pass may fragment it slightly;
         # taking the longest run avoids capturing scattered noise segments.
-        best_start = best_end = cur_start = idxs[0]
-        for prev, cur in zip(idxs, idxs[1:]):
-            if cur == prev + 1:
-                best_end = cur
-            else:
-                if (best_end - cur_start) < (cur - cur_start):
-                    best_start, best_end = cur_start, prev
-                cur_start = cur
-                best_end = max(best_end, prev)
-        # Handle the last run
-        if (cur_start <= idxs[-1]) and (idxs[-1] - cur_start) >= (best_end - best_start):
-            best_start, best_end = cur_start, idxs[-1]
+        # Use explicit run boundaries from diff to avoid silent index bugs.
+        diffs = np.diff(idxs) > 1  # True where there's a gap > 1
+        boundaries = np.where(diffs)[0] + 1  # indices after gaps
+        run_starts = [0] + list(boundaries)
+        run_ends = list(boundaries) + [len(idxs)]
+        
+        # Find longest run by length
+        run_lengths = [run_end - run_start for run_start, run_end in zip(run_starts, run_ends)]
+        longest_run_idx = int(np.argmax(run_lengths))
+        
+        best_start_idx = run_starts[longest_run_idx]
+        best_end_idx = run_ends[longest_run_idx] - 1
+        
+        best_start = idxs[best_start_idx]
+        best_end = idxs[best_end_idx]
 
         steps.append({
             "step_id":    int(c),
