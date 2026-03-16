@@ -97,7 +97,7 @@ class HiEROTask(nn.Module):
         # Load pretrained weights for the text model from the best EgoVLP checkpoint
         if text_encoder_weights:
             logger.info("Loading text encoder weights from %s...", text_encoder_weights)
-            self.text_model.load_state_dict(torch.load(text_encoder_weights))
+            self.text_model.load_state_dict(torch.load(text_encoder_weights, map_location="cpu"))
 
         if text_encoder_full_ft:
             logger.info("Using full fine-tuning for the text encoder.")
