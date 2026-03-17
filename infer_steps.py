@@ -201,27 +201,27 @@ def _smooth_labels(labels: np.ndarray, window: int) -> np.ndarray:
     return smoothed
 
 
+def _get_longest_run(arr: np.ndarray, val: int):
+    mask = arr == val
+    if not mask.any():
+        return -1, -1
+    padded = np.pad(mask, (1, 1), 'constant')
+    diff = np.diff(padded.astype(int))
+    starts = np.where(diff == 1)[0]
+    ends = np.where(diff == -1)[0]
+    lens = ends - starts
+    best_idx = np.argmax(lens)
+    return int(starts[best_idx]), int(ends[best_idx] - 1)
+
 def labels_to_steps(labels: np.ndarray, seg_duration: float, smooth_window: int = 5) -> list:
     """
     Convert per-segment cluster labels into one interval per step.
-
+    
     The label sequence is first smoothed with a mode filter to consolidate
-    scattered noise assignments into coherent regions.  Each cluster's interval
-    is then its **full temporal span** (first to last occurrence) in the
-    smoothed sequence.  Using the span rather than the densest core is
-    essential: GT steps typically last 20–80 s, and a longest-contiguous-run
-    heuristic would capture only a short core fragment while leaving large gaps.
-
-    Parameters
-    ----------
-    labels : ndarray[M]  — integer cluster label; -1 means background/no-step
-    seg_duration : float — duration in seconds of each decoded segment
-    smooth_window : int  — mode-filter window size (in segments)
-
-    Returns
-    -------
-    List of dicts: [{"step_id": int, "start_time": float, "end_time": float}, ...]
-    one entry per step, sorted by start_time, guaranteed non-overlapping.
+    scattered noise assignments into coherent regions. Each cluster's interval
+    is then defined by its longest contiguous run in the smoothed sequence.
+    This naturally avoids overlaps and ignores single noisy assignments 
+    far away from the main step duration.
     """
     unique_clusters = [c for c in np.unique(labels) if c != -1]
     if not unique_clusters:
@@ -231,23 +231,22 @@ def labels_to_steps(labels: np.ndarray, seg_duration: float, smooth_window: int 
 
     steps = []
     for c in unique_clusters:
-        # Use the full span in the smoothed sequence so the interval covers
-        # the step's complete temporal extent, not just its densest core.
-        idxs = np.where(smoothed == c)[0]
-        if len(idxs) == 0:
+        start_idx, end_idx = _get_longest_run(smoothed, c)
+        if start_idx == -1:
             # Cluster was completely smoothed away; fall back to raw labels.
-            idxs = np.where(labels == c)[0]
-        if len(idxs) == 0:
+            start_idx, end_idx = _get_longest_run(labels, c)
+        if start_idx == -1:
             continue
+        
         steps.append({
             "step_id":    int(c),
-            "start_time": round(int(idxs.min()) * seg_duration, 3),
-            "end_time":   round((int(idxs.max()) + 1) * seg_duration, 3),
+            "start_time": round(start_idx * seg_duration, 3),
+            "end_time":   round((end_idx + 1) * seg_duration, 3),
         })
 
     steps.sort(key=lambda x: x["start_time"])
 
-    # Resolve overlaps: clip the earlier step's end to the later step's start.
+    # Resolve overlaps in case fallback to raw labels created any
     for i in range(len(steps) - 1):
         if steps[i]["end_time"] > steps[i + 1]["start_time"]:
             steps[i]["end_time"] = steps[i + 1]["start_time"]
