@@ -459,9 +459,7 @@ def main():
                 # Compare similarity between "correct" (index 0) and "error" (index 1)
                 is_error_preds = (sims[:, 1] > sims[:, 0]).cpu().numpy()
                 for idx, step in enumerate(steps):
-                    has_error = bool(is_error_preds[idx])
-                    step["has_errors"] = has_error
-                    step["label"] = "error" if has_error else "correct"
+                    step["has_errors"] = bool(is_error_preds[idx])
 
         recording_id = os.path.splitext(video_name)[0].replace("_360p_224.mp4_1s_1s", "")
         results[recording_id] = {
@@ -474,10 +472,8 @@ def main():
         # Also save a corresponding boolean array of errors in the .npz for convenience
         if len(steps) > 0 and args.use_proj_head:
             all_embeddings[f"{recording_id}_errors"] = np.array([step.get("has_errors", False) for step in steps], dtype=bool)
-            all_embeddings[f"{recording_id}_labels"] = np.array([step.get("label", "correct") for step in steps], dtype=str)
         else:
             all_embeddings[f"{recording_id}_errors"] = np.zeros(len(steps), dtype=bool)
-            all_embeddings[f"{recording_id}_labels"] = np.full(len(steps), "correct", dtype=str)
 
         n_bg = int((step_labels == -1).sum()) if use_background else 0
         print(f"  {video_name}: {features.shape[0]} input segs → "
