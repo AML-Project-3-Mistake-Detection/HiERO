@@ -468,6 +468,12 @@ def main():
             "embeddings_shape": list(step_embeddings.shape),  # [S, 256]
         }
         all_embeddings[recording_id] = step_embeddings
+        
+        # Also save a corresponding boolean array of errors in the .npz for convenience
+        if len(steps) > 0 and args.use_proj_head:
+            all_embeddings[f"{recording_id}_errors"] = np.array([step.get("has_errors", False) for step in steps], dtype=bool)
+        else:
+            all_embeddings[f"{recording_id}_errors"] = np.zeros(len(steps), dtype=bool)
 
         n_bg = int((step_labels == -1).sum()) if use_background else 0
         print(f"  {video_name}: {features.shape[0]} input segs → "
