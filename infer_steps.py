@@ -439,12 +439,24 @@ def main():
         step_embeddings = compute_step_embeddings(features, steps, fps=args.fps)
 
         # Zero-shot error detection based on textual similarity
-        if len(steps) > 0:
+        if len(steps) > 0 and args.use_proj_head:
             with torch.no_grad():
-                step_emb_tensor = torch.tensor(step_embeddings, dtype=torch.float32, device=args.device)
-                proj_step_embs = task.projector(step_emb_tensor)
+                # segment_features are already projected to the text-aligned space if use_proj_head=True
+                proj_step_embs = []
+                for step in steps:
+                    step_id = step["step_id"]
+                    mask = (step_labels == step_id)
+                    if mask.sum() > 0:
+                        step_feat = segment_features[mask].mean(dim=0)
+                    else:
+                        step_feat = torch.zeros(segment_features.shape[1], device=args.device)
+                    proj_step_embs.append(step_feat)
+                
+                proj_step_embs = torch.stack(proj_step_embs)
                 proj_step_embs = F.normalize(proj_step_embs, p=2, dim=-1)
                 sims = proj_step_embs @ text_features.T
+                
+                # Compare similarity between "correct" (index 0) and "error" (index 1)
                 is_error_preds = (sims[:, 1] > sims[:, 0]).cpu().numpy()
                 for idx, step in enumerate(steps):
                     step["has_errors"] = bool(is_error_preds[idx])
