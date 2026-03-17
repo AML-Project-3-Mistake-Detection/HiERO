@@ -233,41 +233,81 @@ def labels_to_steps(labels: np.ndarray, seg_duration: float, smooth_window: int 
     start_idx = 0
     for i in range(1, len(smoothed)):
         if smoothed[i] != current_step_id:
-            if current_step_id != -1:
-                steps.append({
-                    "step_id": int(current_step_id),
-                    "start_time": round(start_idx * seg_duration, 3),
-                    "end_time": round(i * seg_duration, 3),
-                })
+            steps.append({
+                "step_id": int(current_step_id),
+                "start_time": round(start_idx * seg_duration, 3),
+                "end_time": round(i * seg_duration, 3),
+            })
             current_step_id = smoothed[i]
             start_idx = i
 
-    if current_step_id != -1:
-        steps.append({
-            "step_id": int(current_step_id),
-            "start_time": round(start_idx * seg_duration, 3),
-            "end_time": round(len(smoothed) * seg_duration, 3),
-        })
+    steps.append({
+        "step_id": int(current_step_id),
+        "start_time": round(start_idx * seg_duration, 3),
+        "end_time": round(len(smoothed) * seg_duration, 3),
+    })
 
-    # Avoid gaps and background segments larger than 30s
+    # Dynamically limit step fragmentation
+    expected_steps = int(len(unique_clusters) * 1.25)
+    max_dur_to_merge = 30.0
+    while len(steps) > expected_steps:
+        shortest_idx = min(range(len(steps)), key=lambda idx: steps[idx]['end_time'] - steps[idx]['start_time'])
+        dur = steps[shortest_idx]['end_time'] - steps[shortest_idx]['start_time']
+        
+        if dur > max_dur_to_merge:
+            break
+            
+        idx = shortest_idx
+        left_idx = idx - 1 if idx > 0 else None
+        right_idx = idx + 1 if idx < len(steps) - 1 else None
+        
+        if left_idx is not None and right_idx is not None:
+            l_dur = steps[left_idx]['end_time'] - steps[left_idx]['start_time']
+            r_dur = steps[right_idx]['end_time'] - steps[right_idx]['start_time']
+            merge_with = left_idx if l_dur > r_dur else right_idx
+        elif left_idx is not None:
+            merge_with = left_idx
+        else:
+            merge_with = right_idx
+            
+        target = steps[merge_with]
+        removed = steps.pop(idx)
+        
+        if merge_with < idx:
+            target['end_time'] = removed['end_time']
+        else:
+            target = steps[idx]
+            target['start_time'] = removed['start_time']
+            
+        new_steps = []
+        for s in steps:
+            if new_steps and new_steps[-1]['step_id'] == s['step_id']:
+                new_steps[-1]['end_time'] = s['end_time']
+            else:
+                new_steps.append(s)
+        steps = new_steps
+
+    # Filter out backgrounds
+    valid_steps = [s for s in steps if s['step_id'] != -1]
+
+    # Enforce MAX_GAP = 30.0
     MAX_GAP = 30.0
-    if len(steps) > 0:
-        if steps[0]['start_time'] > MAX_GAP:
-            steps[0]['start_time'] = round(MAX_GAP, 3)
+    if len(valid_steps) > 0:
+        if valid_steps[0]['start_time'] > MAX_GAP:
+            valid_steps[0]['start_time'] = round(MAX_GAP, 3)
 
-    for i in range(len(steps) - 1):
-        gap = steps[i+1]['start_time'] - steps[i]['end_time']
-        if gap > MAX_GAP:
-            excess = gap - MAX_GAP
-            steps[i]['end_time'] = round(steps[i]['end_time'] + excess / 2.0, 3)
-            steps[i+1]['start_time'] = round(steps[i+1]['start_time'] - excess / 2.0, 3)
+        for i in range(len(valid_steps) - 1):
+            gap = valid_steps[i+1]['start_time'] - valid_steps[i]['end_time']
+            if gap > MAX_GAP:
+                excess = gap - MAX_GAP
+                valid_steps[i]['end_time'] = round(valid_steps[i]['end_time'] + excess / 2.0, 3)
+                valid_steps[i+1]['start_time'] = round(valid_steps[i+1]['start_time'] - excess / 2.0, 3)
 
-    if len(steps) > 0:
         video_end = round(len(smoothed) * seg_duration, 3)
-        if video_end - steps[-1]['end_time'] > MAX_GAP:
-            steps[-1]['end_time'] = round(video_end - MAX_GAP, 3)
+        if video_end - valid_steps[-1]['end_time'] > MAX_GAP:
+            valid_steps[-1]['end_time'] = round(video_end - MAX_GAP, 3)
 
-    return steps
+    return valid_steps
 
 
 def main():
