@@ -133,7 +133,7 @@ def build_hiero_model(ckpt: str, fps: float, depth: int, use_proj_head: bool,
 
         return out[graphs.depth == depth]
 
-    return features_extractor, node_length
+    return features_extractor, node_length, task
 
 
 def load_npz_features(path: str) -> torch.Tensor:
@@ -365,7 +365,7 @@ def main():
 
     print(f"Device : {args.device}")
     print(f"Loading model from {args.ckpt}...")
-    features_extractor, seg_duration = build_hiero_model(
+    features_extractor, seg_duration, task = build_hiero_model(
         ckpt=args.ckpt,
         fps=args.fps,
         depth=args.depth,
@@ -375,6 +375,12 @@ def main():
         device=args.device,
     )
     print(f"Each decoded segment covers {seg_duration:.2f}s of source video\n")
+
+    print("Encoding text prompts for zero-shot error detection...")
+    with torch.no_grad():
+        text_prompts = ["a person correctly executing an action", "a person making an error or mistake"]
+        text_features = task.encode_text(text_prompts, device=torch.device(args.device))
+        text_features = F.normalize(text_features, p=2, dim=-1)
 
     npz_files = sorted(glob.glob(os.path.join(args.feature_dir, "*.npz")))
     if not npz_files:
@@ -431,6 +437,17 @@ def main():
 
         # Step-level embeddings: average raw EgoVLP features within each step's boundaries
         step_embeddings = compute_step_embeddings(features, steps, fps=args.fps)
+
+        # Zero-shot error detection based on textual similarity
+        if len(steps) > 0:
+            with torch.no_grad():
+                step_emb_tensor = torch.tensor(step_embeddings, dtype=torch.float32, device=args.device)
+                proj_step_embs = task.projector(step_emb_tensor)
+                proj_step_embs = F.normalize(proj_step_embs, p=2, dim=-1)
+                sims = proj_step_embs @ text_features.T
+                is_error_preds = (sims[:, 1] > sims[:, 0]).cpu().numpy()
+                for idx, step in enumerate(steps):
+                    step["has_errors"] = bool(is_error_preds[idx])
 
         recording_id = os.path.splitext(video_name)[0].replace("_360p_224.mp4_1s_1s", "")
         results[recording_id] = {
