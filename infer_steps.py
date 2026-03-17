@@ -218,10 +218,9 @@ def labels_to_steps(labels: np.ndarray, seg_duration: float, smooth_window: int 
     Convert per-segment cluster labels into one interval per step.
     
     The label sequence is first smoothed with a mode filter to consolidate
-    scattered noise assignments into coherent regions. Each cluster's interval
-    is then defined by its longest contiguous run in the smoothed sequence.
-    This naturally avoids overlaps and ignores single noisy assignments 
-    far away from the main step duration.
+    scattered noise assignments into coherent regions. Each contiguous run 
+    of a cluster is then converted into a step segment, avoiding the deletion 
+    of secondary occurrences. Background gaps are bounded to a maximum of 30s.
     """
     unique_clusters = [c for c in np.unique(labels) if c != -1]
     if not unique_clusters:
@@ -230,28 +229,45 @@ def labels_to_steps(labels: np.ndarray, seg_duration: float, smooth_window: int 
     smoothed = _smooth_labels(labels, window=smooth_window)
 
     steps = []
-    for c in unique_clusters:
-        start_idx, end_idx = _get_longest_run(smoothed, c)
-        if start_idx == -1:
-            # Cluster was completely smoothed away; fall back to raw labels.
-            start_idx, end_idx = _get_longest_run(labels, c)
-        if start_idx == -1:
-            continue
-        
+    current_step_id = smoothed[0]
+    start_idx = 0
+    for i in range(1, len(smoothed)):
+        if smoothed[i] != current_step_id:
+            if current_step_id != -1:
+                steps.append({
+                    "step_id": int(current_step_id),
+                    "start_time": round(start_idx * seg_duration, 3),
+                    "end_time": round(i * seg_duration, 3),
+                })
+            current_step_id = smoothed[i]
+            start_idx = i
+
+    if current_step_id != -1:
         steps.append({
-            "step_id":    int(c),
+            "step_id": int(current_step_id),
             "start_time": round(start_idx * seg_duration, 3),
-            "end_time":   round((end_idx + 1) * seg_duration, 3),
+            "end_time": round(len(smoothed) * seg_duration, 3),
         })
 
-    steps.sort(key=lambda x: x["start_time"])
+    # Avoid gaps and background segments larger than 30s
+    MAX_GAP = 30.0
+    if len(steps) > 0:
+        if steps[0]['start_time'] > MAX_GAP:
+            steps[0]['start_time'] = round(MAX_GAP, 3)
 
-    # Resolve overlaps in case fallback to raw labels created any
     for i in range(len(steps) - 1):
-        if steps[i]["end_time"] > steps[i + 1]["start_time"]:
-            steps[i]["end_time"] = steps[i + 1]["start_time"]
+        gap = steps[i+1]['start_time'] - steps[i]['end_time']
+        if gap > MAX_GAP:
+            excess = gap - MAX_GAP
+            steps[i]['end_time'] = round(steps[i]['end_time'] + excess / 2.0, 3)
+            steps[i+1]['start_time'] = round(steps[i+1]['start_time'] - excess / 2.0, 3)
 
-    return [s for s in steps if s["end_time"] > s["start_time"]]
+    if len(steps) > 0:
+        video_end = round(len(smoothed) * seg_duration, 3)
+        if video_end - steps[-1]['end_time'] > MAX_GAP:
+            steps[-1]['end_time'] = round(video_end - MAX_GAP, 3)
+
+    return steps
 
 
 def main():
