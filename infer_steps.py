@@ -382,6 +382,24 @@ def main():
         text_features = task.encode_text(text_prompts, device=torch.device(args.device))
         text_features = F.normalize(text_features, p=2, dim=-1)
 
+    # Before looping over npz_files, encode the possible descriptions
+    print("Encoding possible step descriptions...")
+    try:
+        with open("gt_step_annotations/step_idx_description.json", "r") as f:
+            desc_dict = json.load(f)
+            possible_descriptions = list(desc_dict.values())
+    except Exception as e:
+        print(f"Could not load descriptions from json: {e}")
+        possible_descriptions = [
+            "pour 1 egg into the ramekin cup",
+            "microwave the ramekin cup uncovered on high for 30 seconds",
+            "top cup with 1 tablespoon of salsa",
+        ]
+
+    with torch.no_grad():
+        desc_features = task.encode_text(possible_descriptions, device=torch.device(args.device))
+        desc_features = torch.nn.functional.normalize(desc_features, p=2, dim=-1)
+
     npz_files = sorted(glob.glob(os.path.join(args.feature_dir, "*.npz")))
     if not npz_files:
         print(f"No .npz files found in '{args.feature_dir}'")
@@ -453,13 +471,15 @@ def main():
                     proj_step_embs.append(step_feat)
                 
                 proj_step_embs = torch.stack(proj_step_embs)
-                proj_step_embs = F.normalize(proj_step_embs, p=2, dim=-1)
-                sims = proj_step_embs @ text_features.T
+                proj_step_embs = torch.nn.functional.normalize(proj_step_embs, p=2, dim=-1)
                 
-                # Compare similarity between "correct" (index 0) and "error" (index 1)
-                is_error_preds = (sims[:, 1] > sims[:, 0]).cpu().numpy()
+                # --- NEW CODE: Match step to text description ---
+                desc_sims = proj_step_embs @ desc_features.T
+                best_match_indices = desc_sims.argmax(dim=1).cpu().numpy()
+                
                 for idx, step in enumerate(steps):
-                    step["has_errors"] = bool(is_error_preds[idx])
+                    matched_idx = best_match_indices[idx]
+                    step["description"] = possible_descriptions[matched_idx]
 
         recording_id = os.path.splitext(video_name)[0].replace("_360p_224.mp4_1s_1s", "")
         results[recording_id] = {
