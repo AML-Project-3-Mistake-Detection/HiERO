@@ -249,7 +249,7 @@ def labels_to_steps(labels: np.ndarray, seg_duration: float, smooth_window: int 
 
     # Dynamically limit step fragmentation
     expected_steps = int(len(unique_clusters) * 1.25)
-    max_dur_to_merge = 30.0
+    max_dur_to_merge = 5.0
     while len(steps) > expected_steps:
         shortest_idx = min(range(len(steps)), key=lambda idx: steps[idx]['end_time'] - steps[idx]['start_time'])
         dur = steps[shortest_idx]['end_time'] - steps[shortest_idx]['start_time']
@@ -291,7 +291,7 @@ def labels_to_steps(labels: np.ndarray, seg_duration: float, smooth_window: int 
     valid_steps = [s for s in steps if s['step_id'] != -1]
 
     # Enforce MAX_GAP = 30.0
-    MAX_GAP = 30.0
+    MAX_GAP = 15.0
     if len(valid_steps) > 0:
         if valid_steps[0]['start_time'] > MAX_GAP:
             valid_steps[0]['start_time'] = round(MAX_GAP, 3)
