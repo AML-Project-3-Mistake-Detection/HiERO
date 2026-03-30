@@ -376,12 +376,6 @@ def main():
     )
     print(f"Each decoded segment covers {seg_duration:.2f}s of source video\n")
 
-    print("Encoding text prompts for zero-shot error detection...")
-    with torch.no_grad():
-        text_prompts = ["a person correctly executing an action", "a person making an error or mistake"]
-        text_features = task.encode_text(text_prompts, device=torch.device(args.device))
-        text_features = F.normalize(text_features, p=2, dim=-1)
-
     npz_files = sorted(glob.glob(os.path.join(args.feature_dir, "*.npz")))
     if not npz_files:
         print(f"No .npz files found in '{args.feature_dir}'")
@@ -438,29 +432,6 @@ def main():
         # Step-level embeddings: average raw EgoVLP features within each step's boundaries
         step_embeddings = compute_step_embeddings(features, steps, fps=args.fps)
 
-        # Zero-shot error detection based on textual similarity
-        if len(steps) > 0 and args.use_proj_head:
-            with torch.no_grad():
-                # segment_features are already projected to the text-aligned space if use_proj_head=True
-                proj_step_embs = []
-                for step in steps:
-                    step_id = step["step_id"]
-                    mask = (step_labels == step_id)
-                    if mask.sum() > 0:
-                        step_feat = segment_features[mask].mean(dim=0)
-                    else:
-                        step_feat = torch.zeros(segment_features.shape[1], device=args.device)
-                    proj_step_embs.append(step_feat)
-                
-                proj_step_embs = torch.stack(proj_step_embs)
-                proj_step_embs = F.normalize(proj_step_embs, p=2, dim=-1)
-                sims = proj_step_embs @ text_features.T
-                
-                # Compare similarity between "correct" (index 0) and "error" (index 1)
-                is_error_preds = (sims[:, 1] > sims[:, 0]).cpu().numpy()
-                for idx, step in enumerate(steps):
-                    step["has_errors"] = bool(is_error_preds[idx])
-
         recording_id = os.path.splitext(video_name)[0].replace("_360p_224.mp4_1s_1s", "")
         results[recording_id] = {
             "recording_id": recording_id,
@@ -468,12 +439,6 @@ def main():
             "embeddings_shape": list(step_embeddings.shape),  # [S, 256]
         }
         all_embeddings[recording_id] = step_embeddings
-        
-        # Also save a corresponding boolean array of errors in the .npz for convenience
-        if len(steps) > 0 and args.use_proj_head:
-            all_embeddings[f"{recording_id}_errors"] = np.array([step.get("has_errors", False) for step in steps], dtype=bool)
-        else:
-            all_embeddings[f"{recording_id}_errors"] = np.zeros(len(steps), dtype=bool)
 
         n_bg = int((step_labels == -1).sum()) if use_background else 0
         print(f"  {video_name}: {features.shape[0]} input segs → "
