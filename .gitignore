@@ -2,4 +2,5 @@ pretrained/*
 video_features/*
 results.json
 gt_step_annotations/*
-__pycache__/*
+__pycache__
+*/__pycache__/*
